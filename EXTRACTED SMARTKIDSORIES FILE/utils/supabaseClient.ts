@@ -1,1 +1,0 @@
-// Supabase connection logic
