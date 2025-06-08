@@ -1,84 +1,111 @@
-// /pages/api/referrals.ts
-import { NextApiRequest, NextApiResponse } from 'next';
-import { supabase } from '@/utils/supabaseClient';
+import { NextApiRequest, NextApiResponse } from 'next'
+import db from '@/lib/db'
+import { sendAlertToAdmin, getFingerprintScore } from '@/lib/monitoring'
+import { getUserById, logReferralAction } from '@/lib/referralUtils'
+import { getDeviceInfo } from '@/lib/deviceInfo'
 
-const MAX_ATTEMPTS = 3;
+const MAX_SCORE = 80
+const REFERRAL_COMMISSION = 40
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  const { method } = req;
+  if (req.method !== 'POST') return res.status(405).json({ message: 'Method not allowed' })
 
-  if (method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+  const {
+    referrerId,
+    referredUserId,
+    hasSubscribed,
+    hasUnlocked,
+    ip,
+    userAgent,
+    registeredAt,
+    unlockedAt,
+  } = req.body
 
-  const { userId, referralCode } = req.body;
+  if (!referrerId || !referredUserId || !ip || !userAgent)
+    return res.status(400).json({ message: 'Missing fields' })
 
-  if (!userId || !referralCode) {
-    return res.status(400).json({ error: 'Missing userId or referralCode' });
-  }
+  try {
+    const referrer = await getUserById(referrerId)
+    const referred = await getUserById(referredUserId)
 
-  // Check if referralCode exists
-  const { data: refData, error: refError } = await supabase
-    .from('referrals')
-    .select('*')
-    .eq('referral_code', referralCode)
-    .single();
+    if (!referrer || !referred) return res.status(404).json({ message: 'User not found' })
 
-  if (refError || !refData) {
-    await logAttempt(userId, 'Invalid referral code');
-    return res.status(400).json({ error: 'Invalid referral code' });
-  }
+    if (!hasSubscribed || !hasUnlocked)
+      return res.status(403).json({ message: 'Referral invalid — no conversion' })
 
-  // Check if already referred
-  const { data: existing, error: existError } = await supabase
-    .from('referrals_log')
-    .select('*')
-    .eq('user_id', userId)
-    .maybeSingle();
+    // Time delay check (minimum 3 minutes between register and unlock)
+    const unlockTime = new Date(unlockedAt)
+    const registerTime = new Date(registeredAt)
+    const minutesDiff = (unlockTime.getTime() - registerTime.getTime()) / 60000
 
-  if (existing) {
-    return res.status(409).json({ error: 'User already referred' });
-  }
+    if (minutesDiff < 3)
+      return res.status(403).json({ message: 'Suspiciously fast conversion — rejected' })
 
-  // Create referral log
-  await supabase.from('referrals_log').insert([
-    {
-      user_id: userId,
-      referred_by: referralCode,
-      timestamp: new Date().toISOString(),
-    },
-  ]);
+    // Fraud score calculation
+    const suspicionScore = await getFingerprintScore({
+      referredUserId,
+      ip,
+      userAgent,
+    })
 
-  // Trigger admin alert & fraud protection if suspicious activity
-  await detectFraud(userId);
+    if (suspicionScore >= MAX_SCORE) {
+      await db.flag.create({
+        data: {
+          userId: referrerId,
+          level: 'high',
+          reason: 'Suspicious referral behavior (auto-scored)',
+        },
+      })
 
-  return res.status(200).json({ message: 'Referral accepted and logged' });
-}
+      await logReferralAction(referrerId, referredUserId, `Blocked — Suspicion score ${suspicionScore}`)
+      await sendAlertToAdmin({
+        type: 'fraud-detected',
+        userId: referrerId,
+        score: suspicionScore,
+        message: 'Referral blocked due to suspected abuse',
+      })
 
-async function logAttempt(userId: string, reason: string) {
-  await supabase.from('fraud_logs').insert([
-    {
-      user_id: userId,
-      reason,
-      time: new Date().toISOString(),
-    },
-  ]);
-}
+      return res.status(403).json({ message: 'Referral blocked — flagged as high risk' })
+    }
 
-async function detectFraud(userId: string) {
-  const { data, error } = await supabase
-    .from('fraud_logs')
-    .select('id')
-    .eq('user_id', userId);
-
-  if (data && data.length >= MAX_ATTEMPTS) {
-    await supabase.from('blacklist').upsert([
-      {
-        user_id: userId,
-        reason: 'Exceeded max fraud attempts',
-        flagged_at: new Date().toISOString(),
+    // Store secure referral
+    const referral = await db.referral.create({
+      data: {
+        referrerId,
+        referredUserId,
+        earned: REFERRAL_COMMISSION,
+        confirmed: true,
+        ip,
+        userAgent,
+        suspicionScore,
       },
-    ]);
-    // Optional: Notify super admin or halt user actions
+    })
+
+    await db.referralSchedule.create({
+      data: {
+        referralId: referral.id,
+        payoutDate: getNextPayoutDate(),
+      },
+    })
+
+    await logReferralAction(referrerId, referredUserId, 'Approved — Secure referral recorded')
+    return res.status(200).json({ success: true, referralId: referral.id })
+  } catch (err) {
+    console.error('Referral error:', err)
+    return res.status(500).json({ message: 'Internal server error' })
   }
+}
+
+function getNextPayoutDate() {
+  const today = new Date()
+  const cutoffDay = 4 // Thursday
+  const payoutDay = 5 // Friday
+
+  if (today.getDay() > cutoffDay || (today.getDay() === cutoffDay && today.getHours() >= 6)) {
+    today.setDate(today.getDate() + (7 - today.getDay() + payoutDay))
+  } else {
+    today.setDate(today.getDate() + (payoutDay - today.getDay()))
+  }
+  today.setHours(9, 0, 0, 0)
+  return today
 }
